@@ -1,9 +1,7 @@
 package com.remotesign.app
 
-import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
-import android.net.Uri
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -48,6 +46,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -63,6 +62,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -126,8 +126,22 @@ private val DarkColors = darkColorScheme(
 
 @Composable
 private fun LibraryTheme(content: @Composable () -> Unit) {
+    val dark = isSystemInDarkTheme()
+    val view = LocalView.current
+    // 全面屏下系统栏图标颜色跟随主题明暗，否则浅色模式下白色图标看不见
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as? android.app.Activity)?.window
+            if (window != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                val controller = window.insetsController
+                val mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                controller?.setSystemBarsAppearance(if (dark) 0 else mask, mask)
+            }
+        }
+    }
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = if (dark) DarkColors else LightColors,
         content = content,
     )
 }
@@ -553,18 +567,14 @@ private fun OwnerScanScreen(
     }
 
     fun openWeChat() {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(SignSpec.authUrl()))
-            .setPackage("com.tencent.mm")
-        try {
-            activity?.startActivity(intent)
-        } catch (e: ActivityNotFoundException) {
-            try {
-                activity?.startActivity(
-                    Intent(Intent.ACTION_VIEW, Uri.parse(SignSpec.authUrl())),
-                )
-            } catch (e2: Exception) {
-                error = "没有找到微信，请用下方扫码方式"
-            }
+        // 微信不接受外部 App 直接拉起它的授权页（会掉进浏览器），
+        // 可行路线：复制授权链接 + 打开微信，由他在微信内粘贴打开完成授权
+        clipboard.setText(AnnotatedString(SignSpec.authUrl()))
+        val launch = activity?.packageManager?.getLaunchIntentForPackage("com.tencent.mm")
+        if (launch != null) {
+            activity?.startActivity(launch)
+        } else {
+            error = "没有找到微信，授权链接已复制，可手动粘贴到微信打开"
         }
     }
 
@@ -594,10 +604,10 @@ private fun OwnerScanScreen(
             onClick = { openWeChat() },
             modifier = Modifier.fillMaxWidth(),
             enabled = !busy,
-        ) { Text("打开微信授权") }
+        ) { Text("复制链接并打开微信") }
         Spacer(Modifier.height(8.dp))
         Text(
-            "微信里点「确认授权」→ 右上角菜单复制链接 → 切回本 App",
+            "在微信「文件传输助手」里粘贴打开 → 点确认授权 → 在打开的页面右上角复制链接 → 切回本 App 自动获取",
             fontSize = 13.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
