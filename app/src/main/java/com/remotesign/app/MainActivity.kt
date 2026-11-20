@@ -2,6 +2,7 @@ package com.remotesign.app
 
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -33,6 +34,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -42,12 +44,13 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -77,6 +80,7 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.remotesign.app.data.PollResult
+import com.remotesign.app.data.SavedCredential
 import com.remotesign.app.data.Session
 import com.remotesign.app.data.SignApi
 import com.remotesign.app.data.SignInfo
@@ -84,6 +88,8 @@ import com.remotesign.app.data.SignSpec
 import com.remotesign.app.data.TokenStore
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+private const val REPO_URL = "https://github.com/autumn231/remote-sign"
 
 // ---------- 主题（图书馆绿 + 奶油纸面） ----------
 
@@ -148,15 +154,37 @@ private fun LibraryTheme(content: @Composable () -> Unit) {
 
 // ---------- 状态 ----------
 
+private enum class CredSource { FRIEND, OWNER }
+
 private sealed interface UiState {
     data object Home : UiState
+    data object About : UiState
     data object FriendInput : UiState
     data class Loading(val text: String) : UiState
     data class Qr(val info: SignInfo) : UiState
     data class Signed(val info: SignInfo) : UiState
     data class Notice(val text: String) : UiState
     data object OwnerScan : UiState
-    data class OwnerCredential(val session: Session) : UiState
+    data class Labeling(
+        val session: Session,
+        val suggested: String?,
+        val source: CredSource,
+    ) : UiState
+    data class OwnerCredential(val credential: SavedCredential) : UiState
+}
+
+/** 页面深度：决定切换动画方向（前进左滑、返回右滑） */
+private fun depthOf(state: UiState): Int = when (state) {
+    UiState.Home -> 0
+    UiState.About -> 1
+    UiState.FriendInput -> 1
+    UiState.OwnerScan -> 1
+    is UiState.Loading -> 2
+    is UiState.Labeling -> 2
+    is UiState.Qr -> 2
+    is UiState.OwnerCredential -> 2
+    is UiState.Signed -> 3
+    is UiState.Notice -> 3
 }
 
 class MainActivity : ComponentActivity() {
@@ -182,10 +210,8 @@ private fun LibrarySignApp() {
     val scope = rememberCoroutineScope()
 
     var state by remember { mutableStateOf<UiState>(UiState.Home) }
-    var homeSession by remember { mutableStateOf(store.session()) }
 
     fun goHome() {
-        homeSession = store.session()
         state = UiState.Home
     }
 
@@ -195,8 +221,8 @@ private fun LibrarySignApp() {
             state = try {
                 val session = store.session()
                 when {
-                    session == null -> UiState.Notice("凭证格式无法识别，请重新导入")
-                    !session.isValid() -> UiState.Notice("凭证已过期，请让对方重新发送")
+                    session == null -> UiState.Notice("还没有保存的凭证")
+                    !session.isValid() -> UiState.Notice("凭证已过期，请重新获取")
                     else -> {
                         val info = api.signInfo()
                         if (info == null) UiState.Notice("当前没有待签到的预约")
@@ -205,6 +231,23 @@ private fun LibrarySignApp() {
                 }
             } catch (e: Exception) {
                 UiState.Notice(e.message ?: "请求失败，请重试")
+            }
+        }
+    }
+
+    /** 拿到一份新凭证（粘贴/换码/扫码）→ 先命名再保存 */
+    fun onObtained(session: Session, source: CredSource) {
+        state = UiState.Labeling(session, store.suggestedLabel(session.token), source)
+    }
+
+    fun onLabelSaved(session: Session, source: CredSource, label: String) {
+        val entry = store.add(label, session.token)
+        when (source) {
+            CredSource.FRIEND -> fetchAndShowQr()
+            CredSource.OWNER -> state = if (entry != null) {
+                UiState.OwnerCredential(entry)
+            } else {
+                UiState.Notice("凭证保存失败")
             }
         }
     }
@@ -225,99 +268,125 @@ private fun LibrarySignApp() {
         },
         label = "screen",
     ) { s ->
-    when (s) {
-        UiState.Home -> HomeScreen(
-            session = homeSession,
-            onFriend = { state = UiState.FriendInput },
-            onOwner = { state = UiState.OwnerScan },
-            onShowQr = { fetchAndShowQr() },
-            onClear = {
-                store.clear()
-                homeSession = null
-            },
-        )
-
-        UiState.FriendInput -> FriendInputScreen(
-            onSubmit = { text ->
-                if (store.save(text) == null) {
-                    null
-                } else {
+        when (s) {
+            UiState.Home -> HomeScreen(
+                store = store,
+                onFriend = { state = UiState.FriendInput },
+                onOwner = { state = UiState.OwnerScan },
+                onShowQr = { entry ->
+                    store.setActive(entry.id)
                     fetchAndShowQr()
-                    Unit
+                },
+                onAbout = { state = UiState.About },
+            )
+
+            UiState.About -> AboutScreen(onBack = { goHome() })
+
+            UiState.FriendInput -> FriendInputScreen(
+                onResolve = { text, setError ->
+                    val parsed = store.parseInput(text)
+                    val code = if (parsed == null) SignApi.extractCode(text) else null
+                    when {
+                        parsed != null -> onObtained(parsed, CredSource.FRIEND)
+                        code != null -> {
+                            state = UiState.Loading("正在换取凭证…")
+                            scope.launch {
+                                try {
+                                    val session = api.exchangeCode(code)
+                                    onObtained(session, CredSource.FRIEND)
+                                } catch (e: Exception) {
+                                    state = UiState.Notice(
+                                        "换取凭证失败：${e.message ?: "授权码可能已过期"}",
+                                    )
+                                }
+                            }
+                        }
+                        else -> setError(
+                            "没识别出来：请粘贴凭证（Authorization=...）、整行 Cookie，或微信授权回调链接",
+                        )
+                    }
+                },
+                onBack = { goHome() },
+            )
+
+            is UiState.Loading -> Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(16.dp))
+                    Text(s.text)
                 }
-            },
-            onBack = { goHome() },
-        )
-
-        is UiState.Loading -> Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center,
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator()
-                Spacer(Modifier.height(16.dp))
-                Text(s.text)
             }
+
+            is UiState.Qr -> QrScreen(
+                info = s.info,
+                ownerLabel = store.active()?.label.orEmpty(),
+                api = api,
+                store = store,
+                onSigned = { state = UiState.Signed(it) },
+                onExpired = { state = UiState.Notice("凭证已过期，请重新获取") },
+                onBack = { goHome() },
+            )
+
+            is UiState.Signed -> SignedScreen(
+                info = s.info,
+                onDone = { goHome() },
+            )
+
+            is UiState.Notice -> NoticeScreen(
+                text = s.text,
+                onBack = { goHome() },
+            )
+
+            UiState.OwnerScan -> OwnerScanScreen(
+                api = api,
+                store = store,
+                onGot = { session -> onObtained(session, CredSource.OWNER) },
+                onBack = { goHome() },
+            )
+
+            is UiState.Labeling -> LabelingScreen(
+                session = s.session,
+                suggested = s.suggested,
+                source = s.source,
+                onSave = { label -> onLabelSaved(s.session, s.source, label) },
+                onCancel = { goHome() },
+            )
+
+            is UiState.OwnerCredential -> OwnerCredentialScreen(
+                credential = s.credential,
+                onShowQr = {
+                    store.setActive(s.credential.id)
+                    fetchAndShowQr()
+                },
+                onDone = { goHome() },
+            )
         }
-
-        is UiState.Qr -> QrScreen(
-            info = s.info,
-            api = api,
-            store = store,
-            onSigned = { state = UiState.Signed(it) },
-            onExpired = { state = UiState.Notice("凭证已过期，请让对方重新发送") },
-            onBack = { goHome() },
-        )
-
-        is UiState.Signed -> SignedScreen(
-            info = s.info,
-            onDone = { goHome() },
-        )
-
-        is UiState.Notice -> NoticeScreen(
-            text = s.text,
-            onBack = { goHome() },
-        )
-
-        UiState.OwnerScan -> OwnerScanScreen(
-            api = api,
-            store = store,
-            onGot = { session -> state = UiState.OwnerCredential(session) },
-            onBack = { goHome() },
-        )
-
-        is UiState.OwnerCredential -> OwnerCredentialScreen(
-            session = s.session,
-            store = store,
-            onShowQr = { fetchAndShowQr() },
-            onDone = { goHome() },
-        )
     }
-    }
-}
-
-/** 页面深度：决定切换动画方向（前进左滑、返回右滑） */
-private fun depthOf(state: UiState): Int = when (state) {
-    UiState.Home -> 0
-    UiState.FriendInput -> 1
-    UiState.OwnerScan -> 1
-    is UiState.Loading -> 2
-    is UiState.Qr -> 2
-    is UiState.OwnerCredential -> 2
-    is UiState.Signed -> 3
-    is UiState.Notice -> 3
 }
 
 // ---------- 首页 ----------
 
 @Composable
 private fun HomeScreen(
-    session: Session?,
+    store: TokenStore,
     onFriend: () -> Unit,
     onOwner: () -> Unit,
-    onShowQr: () -> Unit,
-    onClear: () -> Unit,
+    onShowQr: (SavedCredential) -> Unit,
+    onAbout: () -> Unit,
 ) {
+    var entries by remember { mutableStateOf(store.entries()) }
+    var activeId by remember { mutableStateOf(store.activeId()) }
+    var renaming by remember { mutableStateOf<SavedCredential?>(null) }
+    var deleting by remember { mutableStateOf<SavedCredential?>(null) }
+
+    fun refresh() {
+        entries = store.entries()
+        activeId = store.activeId()
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -354,33 +423,23 @@ private fun HomeScreen(
             badge = "钥",
             badgeColor = MaterialTheme.colorScheme.secondary,
             title = "获取我的凭证",
-            desc = "微信扫码授权，一键拿到自己的凭证发给朋友",
+            desc = "微信授权，一键拿到自己的凭证发给朋友",
             onClick = onOwner,
         )
 
-        if (session != null && session.isValid()) {
-            Spacer(Modifier.height(20.dp))
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                ),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(
-                        "本机已存有有效凭证",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    )
-                    RemainText(expireAtMs = session.expireAtMs, prefix = "剩余 ")
-                    Spacer(Modifier.height(10.dp))
-                    Row {
-                        Button(onClick = onShowQr) { Text("出示签到码") }
-                        Spacer(Modifier.width(10.dp))
-                        OutlinedButton(onClick = onClear) { Text("清除") }
-                    }
-                }
+        if (entries.isNotEmpty()) {
+            Spacer(Modifier.height(24.dp))
+            Text("已保存的凭证", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            entries.forEach { entry ->
+                CredentialCard(
+                    entry = entry,
+                    isActive = entry.id == (activeId ?: entries.firstOrNull()?.id),
+                    onShowQr = { onShowQr(entry) },
+                    onRename = { renaming = entry },
+                    onDelete = { deleting = entry },
+                )
+                Spacer(Modifier.height(10.dp))
             }
         }
 
@@ -390,6 +449,121 @@ private fun HomeScreen(
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(8.dp))
+        TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
+            Text("关于")
+        }
+    }
+
+    renaming?.let { entry ->
+        var name by remember(entry.id) { mutableStateOf(entry.label) }
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("修改用户名") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("用户名") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    store.rename(entry.id, name.trim())
+                    renaming = null
+                    refresh()
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renaming = null }) { Text("取消") }
+            },
+        )
+    }
+
+    deleting?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("删除凭证") },
+            text = { Text("确定删除「${entry.label}」的凭证吗？删除后需要重新获取。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    store.remove(entry.id)
+                    deleting = null
+                    refresh()
+                }) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleting = null }) { Text("取消") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun CredentialCard(
+    entry: SavedCredential,
+    isActive: Boolean,
+    onShowQr: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isActive) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            },
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    entry.label,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isActive) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.primary,
+                    ) {
+                        Text(
+                            "当前",
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            if (entry.isValid()) {
+                RemainText(expireAtMs = entry.expireAtMs, prefix = "剩余 ")
+            } else {
+                Text(
+                    "已过期",
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 14.sp,
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            Row {
+                if (entry.isValid()) {
+                    Button(onClick = onShowQr) { Text("出示签到码") }
+                    Spacer(Modifier.width(8.dp))
+                }
+                OutlinedButton(onClick = onRename) { Text("改名") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(onClick = onDelete) { Text("删除") }
+            }
+        }
     }
 }
 
@@ -454,7 +628,7 @@ private fun RemainText(expireAtMs: Long, prefix: String = "") {
 
 @Composable
 private fun FriendInputScreen(
-    onSubmit: (String) -> Any?,
+    onResolve: (String, (String) -> Unit) -> Unit,
     onBack: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -470,7 +644,7 @@ private fun FriendInputScreen(
         Text("代朋友签到", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         Text(
-            "把朋友发来的登录凭证粘贴到下面，获取他的签到码。",
+            "把朋友发来的登录凭证粘贴到下面，获取他的签到码。微信授权回调链接（带 code= 的那串）也可以直接粘贴，会自动换取凭证。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(20.dp))
@@ -481,18 +655,14 @@ private fun FriendInputScreen(
                 .fillMaxWidth()
                 .height(150.dp),
             label = { Text("登录凭证") },
-            placeholder = { Text("Authorization=eyJ... 或整行 Cookie") },
+            placeholder = { Text("Authorization=eyJ...、整行 Cookie 或授权回调链接") },
             isError = error != null,
             supportingText = error?.let { { Text(it) } },
             shape = RoundedCornerShape(12.dp),
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            onClick = {
-                if (onSubmit(input) == null) {
-                    error = "没识别出凭证，请粘贴 Authorization=... 或整行 Cookie"
-                }
-            },
+            onClick = { onResolve(input) { msg -> error = msg } },
             modifier = Modifier.fillMaxWidth(),
             enabled = input.isNotBlank(),
         ) { Text("获取签到码") }
@@ -509,7 +679,7 @@ private fun FriendInputScreen(
     }
 }
 
-// ---------- 获取我的凭证：微信扫码授权 ----------
+// ---------- 获取我的凭证：微信授权 ----------
 
 @Composable
 private fun OwnerScanScreen(
@@ -533,7 +703,7 @@ private fun OwnerScanScreen(
             return
         }
         // 剪贴板里直接就是 JWT 的情况
-        val direct = store.save(text)
+        val direct = store.parseInput(text)
         if (direct != null) {
             onGot(direct)
             return
@@ -661,7 +831,7 @@ private fun OwnerScanScreen(
         ) { Text("返回") }
         Spacer(Modifier.height(16.dp))
         Text(
-            "授权码约 5 分钟有效，过期重新扫码即可。二维码是官方公众号的授权链接，扫码后在微信内完成，本 App 不接触你的微信密码。",
+            "授权码约 5 分钟有效，过期重新授权即可。授权在微信内完成，本 App 不接触你的微信密码。",
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -669,19 +839,71 @@ private fun OwnerScanScreen(
     }
 }
 
+// ---------- 命名保存 ----------
+
+@Composable
+private fun LabelingScreen(
+    session: Session,
+    suggested: String?,
+    source: CredSource,
+    onSave: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var name by remember { mutableStateOf(suggested ?: "") }
+    val fallback = when (source) {
+        CredSource.OWNER -> "我的凭证"
+        CredSource.FRIEND -> "朋友的凭证"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp),
+    ) {
+        Text("这是谁的凭证？", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "给这份凭证标上用户名，保存多份时不会弄混。出示签到码时也会显示这个名字。",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(20.dp))
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("用户名") },
+            placeholder = { Text("例如：张三") },
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp),
+        )
+        Spacer(Modifier.height(8.dp))
+        RemainText(expireAtMs = session.expireAtMs, prefix = "这份凭证有效期剩余 ")
+        Spacer(Modifier.height(20.dp))
+        Button(
+            onClick = { onSave(name.trim().ifBlank { suggested ?: fallback }) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("保存") }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("取消（不保存）") }
+    }
+}
+
 // ---------- 我的凭证 ----------
 
 @Composable
 private fun OwnerCredentialScreen(
-    session: Session,
-    store: TokenStore,
+    credential: SavedCredential,
     onShowQr: () -> Unit,
     onDone: () -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
-    val token = session.token
+    val token = credential.token
     val masked = if (token.length > 22) {
         token.take(12) + " … " + token.takeLast(8)
     } else token
@@ -708,13 +930,19 @@ private fun OwnerCredentialScreen(
         ) {
             Column(Modifier.padding(16.dp)) {
                 Text(
+                    credential.label,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
                     masked,
                     fontSize = 14.sp,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.height(6.dp))
-                RemainText(expireAtMs = session.expireAtMs, prefix = "有效期剩余 ")
+                RemainText(expireAtMs = credential.expireAtMs, prefix = "有效期剩余 ")
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -760,6 +988,7 @@ private fun OwnerCredentialScreen(
 @Composable
 private fun QrScreen(
     info: SignInfo,
+    ownerLabel: String,
     api: SignApi,
     store: TokenStore,
     onSigned: (SignInfo) -> Unit,
@@ -843,6 +1072,21 @@ private fun QrScreen(
                 modifier = Modifier.padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                if (ownerLabel.isNotBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                    ) {
+                        Text(
+                            "凭证：$ownerLabel",
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
                 Text(
                     listOf(current.libName, current.floor)
                         .filter { it.isNotBlank() }.joinToString(" · "),
@@ -947,6 +1191,114 @@ private fun NoticeScreen(text: String, onBack: () -> Unit) {
         Spacer(Modifier.height(24.dp))
         Button(onClick = onBack) { Text("返回首页") }
     }
+}
+
+// ---------- 关于 ----------
+
+@Composable
+private fun AboutScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Image(
+                painter = painterResource(R.mipmap.ic_launcher),
+                contentDescription = null,
+                modifier = Modifier
+                    .size(76.dp)
+                    .clip(RoundedCornerShape(18.dp)),
+            )
+            Spacer(Modifier.height(12.dp))
+            Text("图书馆随签", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "版本 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "「我去图书馆」远程代签到工具：把登录凭证交给在馆的朋友，即可出示你的签到码。",
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
+        AboutSection("开源地址") {
+            Text(REPO_URL, fontSize = 14.sp)
+            Spacer(Modifier.height(8.dp))
+            Row {
+                Button(onClick = {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(REPO_URL)))
+                }) { Text("打开仓库") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(onClick = {
+                    clipboard.setText(AnnotatedString(REPO_URL))
+                    copied = true
+                }) { Text(if (copied) "已复制" else "复制地址") }
+            }
+            Text(
+                "本软件开源免费，欢迎提交问题与改进建议。",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        AboutSection("免责声明") {
+            AboutText("1. 本软件为开源学习工具，仅供学习交流与技术研究使用。")
+            AboutText("2. 本软件与「我去图书馆」（TraceInt）及其运营方、与任何学校均无隶属、合作或授权关系；文中名称仅用于说明用途。")
+            AboutText("3. 使用者应遵守所在学校图书馆的规章制度。代签、冒用他人凭证等行为可能违反相关规定，由此产生的一切后果（包括但不限于账号处罚、预约资格取消）由使用者自行承担，开发者不承担任何责任。")
+            AboutText("4. 登录凭证等同于账号在有效期内的访问权限，请妥善保管、仅向可信的人分享；因凭证保管不当造成的损失由使用者自行承担。")
+            AboutText("5. 本软件按「现状」提供，不作任何明示或暗示的保证；所依赖的第三方接口可能随时变更或失效，开发者不保证软件持续可用。")
+        }
+
+        AboutSection("隐私说明") {
+            AboutText("• 不收集、不上传任何个人信息，无统计、无广告、无第三方 SDK。")
+            AboutText("• 凭证仅保存在本机，可在首页随时删除；除直连图书馆签到接口外，软件不发起任何其他网络请求。")
+        }
+
+        AboutSection("技术说明") {
+            AboutText("接口逻辑与开源项目 gotolibrary 的实测实现一致；二维码由 ZXing 生成。凭证（JWT）有效期约 2 小时，过期后需重新获取。")
+        }
+
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onBack,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("返回") }
+    }
+}
+
+@Composable
+private fun AboutSection(
+    title: String,
+    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
+) {
+    Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(8.dp))
+    Card(
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(14.dp), content = content)
+    }
+    Spacer(Modifier.height(18.dp))
+}
+
+@Composable
+private fun AboutText(text: String) {
+    Text(text, fontSize = 14.sp)
+    Spacer(Modifier.height(6.dp))
 }
 
 // ---------- 工具 ----------

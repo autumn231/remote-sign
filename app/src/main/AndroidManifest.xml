@@ -9,7 +9,7 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="图书馆随签"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@style/Theme.LibrarySign">
         <activity
             android:name=".MainActivity"
             android:exported="true"

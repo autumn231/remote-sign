@@ -9,8 +9,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -83,38 +85,144 @@ data class Session(
         (expireAtMs - now).coerceAtLeast(0)
 }
 
-/** 登录凭证（JWT）存储：粘贴导入、解析过期时间、持久化 */
+/** 一份已保存的凭证（带用户名标签，可存多份） */
+data class SavedCredential(
+    val id: String,
+    val label: String,
+    val token: String,
+    val expireAtMs: Long,
+    val addedAtMs: Long,
+) {
+    fun isValid(now: Long = System.currentTimeMillis()): Boolean =
+        token.isNotEmpty() && expireAtMs > now
+
+    fun remainMs(now: Long = System.currentTimeMillis()): Long =
+        (expireAtMs - now).coerceAtLeast(0)
+
+    fun toSession(): Session = Session(token, expireAtMs)
+}
+
+/**
+ * 凭证存储：可保存多份，每份带用户名标签，其中一份为「当前使用」。
+ * 旧版本只存一份（key=jwt），首次启动自动迁移为带标签的一份。
+ */
 class TokenStore(context: Context) {
 
     private val sp: SharedPreferences =
         context.getSharedPreferences("remote_sign_session", Context.MODE_PRIVATE)
 
-    fun rawToken(): String = sp.getString(KEY_TOKEN, "").orEmpty()
-
-    fun session(): Session? {
-        val token = rawToken()
-        if (token.isEmpty()) return null
-        return parseJwt(token)
+    init {
+        migrateLegacy()
     }
 
-    /** 从任意粘贴内容里抠出 JWT 并保存；成功返回解析出的 Session */
-    fun save(input: String): Session? {
+    // ---------- 列表管理 ----------
+
+    fun entries(): List<SavedCredential> {
+        val raw = sp.getString(KEY_LIST, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    add(
+                        SavedCredential(
+                            id = o.getString("id"),
+                            label = o.optString("label", "未命名"),
+                            token = o.getString("token"),
+                            expireAtMs = o.optLong("expireAtMs"),
+                            addedAtMs = o.optLong("addedAtMs"),
+                        ),
+                    )
+                }
+            }.sortedByDescending { it.addedAtMs }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun persist(list: List<SavedCredential>) {
+        val arr = JSONArray()
+        list.forEach { c ->
+            arr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("label", c.label)
+                    .put("token", c.token)
+                    .put("expireAtMs", c.expireAtMs)
+                    .put("addedAtMs", c.addedAtMs),
+            )
+        }
+        sp.edit().putString(KEY_LIST, arr.toString()).commit()
+    }
+
+    fun activeId(): String? = sp.getString(KEY_ACTIVE, null)
+
+    fun active(): SavedCredential? {
+        val list = entries()
+        val id = activeId()
+        return list.firstOrNull { it.id == id } ?: list.firstOrNull()
+    }
+
+    fun setActive(id: String) {
+        sp.edit().putString(KEY_ACTIVE, id).commit()
+    }
+
+    /** 新增一份凭证并设为当前；同一 token 已存在时更新其标签与有效期 */
+    fun add(label: String, token: String): SavedCredential? {
+        val session = parseJwt(token) ?: return null
+        val list = entries().toMutableList()
+        val existing = list.firstOrNull { it.token == token }
+        val entry = if (existing != null) {
+            existing.copy(
+                label = label.ifBlank { existing.label },
+                expireAtMs = session.expireAtMs,
+            )
+        } else {
+            SavedCredential(
+                id = UUID.randomUUID().toString(),
+                label = label.ifBlank { "未命名凭证" },
+                token = token,
+                expireAtMs = session.expireAtMs,
+                addedAtMs = System.currentTimeMillis(),
+            )
+        }
+        if (existing != null) {
+            list[list.indexOf(existing)] = entry
+        } else {
+            list.add(entry)
+        }
+        persist(list)
+        setActive(entry.id)
+        return entry
+    }
+
+    fun rename(id: String, label: String) {
+        if (label.isBlank()) return
+        persist(entries().map { if (it.id == id) it.copy(label = label) else it })
+    }
+
+    fun remove(id: String) {
+        val list = entries().filter { it.id != id }
+        persist(list)
+        if (activeId() == id) {
+            val next = list.firstOrNull()
+            if (next != null) setActive(next.id) else sp.edit().remove(KEY_ACTIVE).commit()
+        }
+    }
+
+    // ---------- 当前凭证（供接口层使用） ----------
+
+    fun rawToken(): String = active()?.token.orEmpty()
+
+    fun session(): Session? = active()?.toSession()
+
+    // ---------- 解析（不落盘） ----------
+
+    /** 从任意粘贴内容里抠出 JWT 并解析；不保存 */
+    fun parseInput(input: String): Session? {
         val token = extractToken(input)
         if (token.isEmpty()) return null
-        return saveToken(token)
-    }
-
-    /** 直接保存一个裸 JWT */
-    fun saveToken(token: String): Session? {
-        val trimmed = token.trim()
-        if (trimmed.isEmpty()) return null
-        val session = parseJwt(trimmed) ?: return null
-        val ok = sp.edit().putString(KEY_TOKEN, trimmed).commit()
-        return if (ok) session else null
-    }
-
-    fun clear() {
-        sp.edit().remove(KEY_TOKEN).commit()
+        return parseJwt(token)
     }
 
     /**
@@ -136,25 +244,44 @@ class TokenStore(context: Context) {
         return ""
     }
 
-    /** 解 JWT payload 读过期时间（不校验签名，校验在服务端） */
-    fun parseJwt(token: String): Session? = try {
+    /** 解 JWT payload（不校验签名，校验在服务端） */
+    fun jwtClaims(token: String): JSONObject? = try {
         val parts = token.split(".")
         if (parts.size < 2) null else {
-            val payload = String(Base64.getUrlDecoder().decode(pad(parts[1])), Charsets.UTF_8)
-            val json = JSONObject(payload)
-            val raw = json.optLong("expireAt").takeIf { it > 0 }
-                ?: json.optLong("exp").takeIf { it > 0 }
-                ?: 0L
-            // 服务端 expireAt 是秒级时间戳；若拿到的是毫秒级则直接用
-            val expireMs = when {
-                raw <= 0L -> 0L
-                raw < 100_000_000_000L -> raw * 1000
-                else -> raw
-            }
-            Session(token = token, expireAtMs = expireMs)
+            JSONObject(String(Base64.getUrlDecoder().decode(pad(parts[1])), Charsets.UTF_8))
         }
     } catch (e: Exception) {
         null
+    }
+
+    fun parseJwt(token: String): Session? {
+        val json = jwtClaims(token) ?: return null
+        val raw = json.optLong("expireAt").takeIf { it > 0 }
+            ?: json.optLong("exp").takeIf { it > 0 }
+            ?: 0L
+        // 服务端 expireAt 是秒级时间戳；若拿到的是毫秒级则直接用
+        val expireMs = when {
+            raw <= 0L -> 0L
+            raw < 100_000_000_000L -> raw * 1000
+            else -> raw
+        }
+        return Session(token = token, expireAtMs = expireMs)
+    }
+
+    /** 从 JWT 声明里猜用户名，作为命名时的默认建议 */
+    fun suggestedLabel(token: String): String? {
+        val json = jwtClaims(token) ?: return null
+        val nameKeys = listOf(
+            "name", "nickname", "nickName", "userName", "username",
+            "realName", "xm", "studentName", "student_name",
+        )
+        for (key in nameKeys) {
+            val v = json.optString(key).trim()
+            if (v.isNotEmpty()) return v
+        }
+        val uid = json.opt("userId")?.toString()?.trim().orEmpty()
+        if (uid.isNotEmpty() && uid != "0") return "用户 $uid"
+        return null
     }
 
     private fun pad(s: String): String {
@@ -162,8 +289,27 @@ class TokenStore(context: Context) {
         return if (rem == 0) s else s + "=".repeat(4 - rem)
     }
 
+    private fun migrateLegacy() {
+        if (sp.contains(KEY_LIST)) return
+        val legacy = sp.getString(KEY_LEGACY, "").orEmpty()
+        if (legacy.isEmpty()) return
+        val session = parseJwt(legacy) ?: return
+        val entry = SavedCredential(
+            id = UUID.randomUUID().toString(),
+            label = suggestedLabel(legacy) ?: "我的凭证",
+            token = legacy,
+            expireAtMs = session.expireAtMs,
+            addedAtMs = System.currentTimeMillis(),
+        )
+        persist(listOf(entry))
+        setActive(entry.id)
+        sp.edit().remove(KEY_LEGACY).commit()
+    }
+
     private companion object {
-        const val KEY_TOKEN = "jwt"
+        const val KEY_LIST = "credentials"
+        const val KEY_ACTIVE = "active_id"
+        const val KEY_LEGACY = "jwt"
     }
 }
 
@@ -293,7 +439,7 @@ class SignApi(private val store: TokenStore) {
         }
 
     /**
-     * 用微信授权回调里的 code 换 JWT 并保存。
+     * 用微信授权回调里的 code 换 JWT（只换不存，命名保存由界面层处理）。
      * 服务端返回 302 + Set-Cookie: Authorization=<JWT>；code 有效期约 5 分钟。
      */
     suspend fun exchangeCode(code: String): Session = withContext(Dispatchers.IO) {
@@ -309,11 +455,11 @@ class SignApi(private val store: TokenStore) {
         client.newCall(request).execute().use { resp ->
             val cookies = Cookie.parseAll(resp.request.url, resp.headers)
             val auth = cookies.firstOrNull { it.name.equals("Authorization", true) }
-                ?: throw ApiException("没有拿到登录凭证，授权码可能已过期（有效期约 5 分钟），请重新扫码")
-            val session = store.saveToken(auth.value)
+                ?: throw ApiException("没有拿到登录凭证，授权码可能已过期（有效期约 5 分钟），请重新授权")
+            val session = store.parseJwt(auth.value)
                 ?: throw ApiException("凭证格式无法识别")
             if (!session.isValid()) {
-                throw ApiException("拿到的凭证已过期，请重新扫码")
+                throw ApiException("拿到的凭证已过期，请重新授权")
             }
             session
         }

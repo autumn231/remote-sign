@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 退出 Android 15 强制全面屏：内容不钻到状态栏下面，状态栏图标由系统按主题着色 -->
+    <style name="Theme.LibrarySign" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>
