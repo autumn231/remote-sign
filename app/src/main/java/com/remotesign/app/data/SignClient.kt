@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -24,10 +25,15 @@ import java.util.concurrent.TimeUnit
  *   - code=10       → msg 是新 token，换码重画
  *   - code=1 / 55   → 签到成功（服务端把成功也放在 errors 通道里）
  *   - code=40001    → 登录态失效
+ *
+ * 获取本人凭证（微信 OAuth code 换 JWT）：
+ *   GET https://wechat.v2.traceint.com/index.php/urlNew/auth.html?r=...&code=<code>&state=1
+ *   → 302，Set-Cookie: Authorization=<JWT>
  */
 object SignSpec {
     const val HOST = "https://wechat.v2.traceint.com"
     const val GRAPHQL = "$HOST/index.php/graphql/"
+    const val AUTH = "$HOST/index.php/urlNew/auth.html"
     const val WEB_ORIGIN = "https://web.traceint.com"
     const val APP_VERSION = "2.2.5"
 
@@ -36,6 +42,19 @@ object SignSpec {
             "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.6099.144 " +
             "Mobile Safari/537.36 MicroMessenger/8.0.49.2600(0x2800313D) " +
             "WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64"
+
+    /** 官方公众号 appid（与 gotolibrary 实测一致） */
+    const val WX_APPID = "wx2996d437cd442527"
+
+    /** 直接把 GraphQL 端点当 redirect_uri，微信授权后回跳到这里并带上 code */
+    const val REDIRECT_URI = "$HOST/index.php/graphql"
+
+    fun authUrl(): String = buildString {
+        append("https://open.weixin.qq.com/connect/oauth2/authorize")
+        append("?appid=").append(WX_APPID)
+        append("&redirect_uri=").append(java.net.URLEncoder.encode(REDIRECT_URI, "UTF-8"))
+        append("&response_type=code&scope=snsapi_userinfo&state=1#wechat_redirect")
+    }
 
     /** 签到页聚合：当前预约（含签到 token） */
     const val Q_SIGN_INFO =
@@ -82,8 +101,15 @@ class TokenStore(context: Context) {
     fun save(input: String): Session? {
         val token = extractToken(input)
         if (token.isEmpty()) return null
-        val session = parseJwt(token) ?: return null
-        val ok = sp.edit().putString(KEY_TOKEN, token).commit()
+        return saveToken(token)
+    }
+
+    /** 直接保存一个裸 JWT */
+    fun saveToken(token: String): Session? {
+        val trimmed = token.trim()
+        if (trimmed.isEmpty()) return null
+        val session = parseJwt(trimmed) ?: return null
+        val ok = sp.edit().putString(KEY_TOKEN, trimmed).commit()
         return if (ok) session else null
     }
 
@@ -266,9 +292,45 @@ class SignApi(private val store: TokenStore) {
             PollResult.Failed(e.message ?: "网络错误")
         }
 
+    /**
+     * 用微信授权回调里的 code 换 JWT 并保存。
+     * 服务端返回 302 + Set-Cookie: Authorization=<JWT>；code 有效期约 5 分钟。
+     */
+    suspend fun exchangeCode(code: String): Session = withContext(Dispatchers.IO) {
+        val url = "${SignSpec.AUTH}?r=" +
+            java.net.URLEncoder.encode("${SignSpec.HOST}/web/index.html", "UTF-8") +
+            "&code=$code&state=1"
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", SignSpec.UA)
+            .get()
+            .build()
+
+        client.newCall(request).execute().use { resp ->
+            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+            val auth = cookies.firstOrNull { it.name.equals("Authorization", true) }
+                ?: throw ApiException("没有拿到登录凭证，授权码可能已过期（有效期约 5 分钟），请重新扫码")
+            val session = store.saveToken(auth.value)
+                ?: throw ApiException("凭证格式无法识别")
+            if (!session.isValid()) {
+                throw ApiException("拿到的凭证已过期，请重新扫码")
+            }
+            session
+        }
+    }
+
     companion object {
         /** 需要换码（msg 是新 token） */
         const val QR_ROTATE_CODE = 10
+
+        /** 从回调链接（或任意粘贴文本）里抠出微信授权 code */
+        fun extractCode(text: String): String? {
+            val m = Regex("[?&]code=([A-Za-z0-9_\\-]+)").find(text)
+            if (m != null) return m.groupValues[1]
+            // 直接粘贴的就是 code 本身
+            val t = text.trim()
+            return if (t.matches(Regex("[A-Za-z0-9_\\-]{16,64}"))) t else null
+        }
     }
 }
 

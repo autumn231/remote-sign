@@ -5,7 +5,9 @@
 
     <application
         android:allowBackup="false"
-        android:label="远程签到"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="图书馆随签"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
