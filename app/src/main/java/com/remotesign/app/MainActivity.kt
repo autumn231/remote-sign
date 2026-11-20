@@ -1,12 +1,21 @@
 package com.remotesign.app
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -19,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -141,7 +151,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             LibraryTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    LibrarySignApp()
+                    Box(Modifier.safeDrawingPadding()) {
+                        LibrarySignApp()
+                    }
                 }
             }
         }
@@ -186,7 +198,20 @@ private fun LibrarySignApp() {
     // 子页面统一返回首页
     BackHandler(enabled = state != UiState.Home && state !is UiState.Loading) { goHome() }
 
-    when (val s = state) {
+    AnimatedContent(
+        targetState = state,
+        transitionSpec = {
+            if (depthOf(targetState) >= depthOf(initialState)) {
+                (slideInHorizontally { it / 3 } + fadeIn()) togetherWith
+                    (slideOutHorizontally { -it / 3 } + fadeOut())
+            } else {
+                (slideInHorizontally { -it / 3 } + fadeIn()) togetherWith
+                    (slideOutHorizontally { it / 3 } + fadeOut())
+            }
+        },
+        label = "screen",
+    ) { s ->
+    when (s) {
         UiState.Home -> HomeScreen(
             session = homeSession,
             onFriend = { state = UiState.FriendInput },
@@ -254,6 +279,19 @@ private fun LibrarySignApp() {
             onDone = { goHome() },
         )
     }
+    }
+}
+
+/** 页面深度：决定切换动画方向（前进左滑、返回右滑） */
+private fun depthOf(state: UiState): Int = when (state) {
+    UiState.Home -> 0
+    UiState.FriendInput -> 1
+    UiState.OwnerScan -> 1
+    is UiState.Loading -> 2
+    is UiState.Qr -> 2
+    is UiState.OwnerCredential -> 2
+    is UiState.Signed -> 3
+    is UiState.Notice -> 3
 }
 
 // ---------- 首页 ----------
@@ -514,6 +552,22 @@ private fun OwnerScanScreen(
         onDispose { activity?.lifecycle?.removeObserver(observer) }
     }
 
+    fun openWeChat() {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(SignSpec.authUrl()))
+            .setPackage("com.tencent.mm")
+        try {
+            activity?.startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            try {
+                activity?.startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(SignSpec.authUrl())),
+                )
+            } catch (e2: Exception) {
+                error = "没有找到微信，请用下方扫码方式"
+            }
+        }
+    }
+
     val qrBitmap = remember { makeQrBitmap(SignSpec.authUrl(), highDensity = true) }
 
     Column(
@@ -531,24 +585,43 @@ private fun OwnerScanScreen(
         )
         Spacer(Modifier.height(6.dp))
         Text(
-            "用微信扫一扫下面的二维码完成授权，然后在微信里复制回调页的链接，切回本 App 即可自动换取凭证。",
+            "在微信里确认授权后，复制回调页的链接，切回本 App 即可自动换取凭证。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(20.dp))
+        Button(
+            onClick = { openWeChat() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !busy,
+        ) { Text("打开微信授权") }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "微信里点「确认授权」→ 右上角菜单复制链接 → 切回本 App",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "或用另一台设备扫码授权",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
         Card(
             shape = RoundedCornerShape(20.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White),
         ) {
-            Box(Modifier.padding(14.dp)) {
+            Box(Modifier.padding(12.dp)) {
                 if (qrBitmap != null) {
                     Image(
                         bitmap = qrBitmap.asImageBitmap(),
                         contentDescription = "微信授权二维码",
-                        modifier = Modifier.size(260.dp),
+                        modifier = Modifier.size(210.dp),
                     )
                 } else {
-                    Text("二维码生成失败", modifier = Modifier.size(260.dp))
+                    Text("二维码生成失败", modifier = Modifier.size(210.dp))
                 }
             }
         }
@@ -783,14 +856,16 @@ private fun QrScreen(
                         .background(Color.White, RoundedCornerShape(12.dp))
                         .padding(10.dp),
                 ) {
-                    if (qrBitmap != null) {
-                        Image(
-                            bitmap = qrBitmap.asImageBitmap(),
-                            contentDescription = "签到二维码",
-                            modifier = Modifier.size(272.dp),
-                        )
-                    } else {
-                        Text("二维码生成失败", modifier = Modifier.size(272.dp))
+                    Crossfade(targetState = qrBitmap, label = "qrSwap") { bmp ->
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "签到二维码",
+                                modifier = Modifier.size(272.dp),
+                            )
+                        } else {
+                            Text("二维码生成失败", modifier = Modifier.size(272.dp))
+                        }
                     }
                 }
                 Spacer(Modifier.height(14.dp))
