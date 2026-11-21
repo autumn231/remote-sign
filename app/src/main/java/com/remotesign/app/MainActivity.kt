@@ -19,6 +19,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -138,11 +139,21 @@ private fun LibraryTheme(content: @Composable () -> Unit) {
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as? android.app.Activity)?.window
-            if (window != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-                val controller = window.insetsController
-                val mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
-                    android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-                controller?.setSystemBarsAppearance(if (dark) 0 else mask, mask)
+            if (window != null) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    val controller = window.insetsController
+                    val mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                        android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                    controller?.setSystemBarsAppearance(if (dark) 0 else mask, mask)
+                }
+                // 旧旗标通道再补一遍：部分国产 ROM 对 insetsController 的外观位不敏感，
+                // 只认 decorView 的 LIGHT_STATUS_BAR 旗标
+                @Suppress("DEPRECATION")
+                val flags = android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+                    android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                val vis = window.decorView.systemUiVisibility
+                window.decorView.systemUiVisibility =
+                    if (dark) vis and flags.inv() else vis or flags
             }
         }
     }
@@ -399,7 +410,7 @@ private fun HomeScreen(
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(190.dp)
+                .aspectRatio(1.6f)
                 .clip(RoundedCornerShape(20.dp)),
         )
         Spacer(Modifier.height(20.dp))
@@ -578,11 +589,12 @@ private fun EntryCard(
     Card(
         onClick = onClick,
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier.padding(18.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -595,14 +607,19 @@ private fun EntryCard(
                 Text(badge, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             }
             Spacer(Modifier.width(14.dp))
-            Column {
-                Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 Text(
                     desc,
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            Text(
+                "›",
+                fontSize = 24.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -1267,7 +1284,7 @@ private fun AboutScreen(onBack: () -> Unit) {
         }
 
         AboutSection("技术说明") {
-            AboutText("接口逻辑与开源项目 gotolibrary 的实测实现一致；二维码由 ZXing 生成。凭证（JWT）有效期约 2 小时，过期后需重新获取。")
+            AboutText("接口逻辑参考开源项目 IGoLibrary：https://github.com/EJianZQ/IGoLibrary ；二维码由 ZXing 生成。凭证（JWT）有效期约 2 小时，过期后需重新获取。")
         }
 
         Spacer(Modifier.height(8.dp))
