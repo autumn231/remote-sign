@@ -418,16 +418,21 @@ private fun HomeScreen(
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(1.6f)
+                .aspectRatio(1.35f)
                 .clip(RoundedCornerShape(20.dp)),
         )
         Spacer(Modifier.height(20.dp))
-        Text("图书馆随签", fontSize = 30.sp, fontWeight = FontWeight.Bold)
-        Text(
-            "我去图书馆 · 远程代签到",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 15.sp,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("图书馆随签", fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "我去图书馆 · 远程代签到",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 15.sp,
+                )
+            }
+            TextButton(onClick = onAbout) { Text("关于") }
+        }
         Spacer(Modifier.height(24.dp))
 
         EntryCard(
@@ -468,10 +473,6 @@ private fun HomeScreen(
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Spacer(Modifier.height(8.dp))
-        TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
-            Text("关于")
-        }
     }
 
     renaming?.let { entry ->
@@ -1272,7 +1273,7 @@ private fun AboutScreen(onBack: () -> Unit) {
                 }) { Text(if (copied) "已复制" else "复制地址") }
             }
             Text(
-                "本软件开源免费，欢迎提交问题与改进建议。",
+                "本软件基于 MIT 开源协议发布，免费使用，欢迎提交问题与改进建议。",
                 fontSize = 13.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
