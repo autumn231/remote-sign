@@ -16,7 +16,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * 「我去图书馆」（web.traceint.com）签到接口层，逻辑与 gotolibrary 的实测实现一致：
+ * 「我去图书馆」（web.traceint.com）签到接口层，参考 IGoLibrary 等开源项目的实测接口：
  *
  *   POST https://wechat.v2.traceint.com/index.php/graphql/
  *   Headers: app-version: 2.2.5 / Origin: https://web.traceint.com
@@ -65,6 +65,10 @@ object SignSpec {
     /** 二维码轮换/签到状态轮询 */
     const val Q_QR_STATUS =
         "query getQrCodeStatus(\$oldToken: String!) { userAuth { reserve { getQrCodeStatus(oldToken: \$oldToken) } } }"
+
+    /** 当前登录用户资料（服务器返回真实姓名/昵称/学号，用于给凭证自动命名） */
+    const val Q_USER_PROFILE =
+        "query userProfile { userAuth { currentUser { user_student_name user_nick user_student_no } } }"
 }
 
 /** 业务错误（接口真的没干成） */
@@ -356,8 +360,9 @@ class SignApi(private val store: TokenStore) {
         operation: String,
         query: String,
         variables: Map<String, Any?> = emptyMap(),
+        tokenOverride: String? = null,
     ): JSONObject = withContext(Dispatchers.IO) {
-        val token = store.rawToken()
+        val token = tokenOverride ?: store.rawToken()
         if (token.isEmpty()) throw ApiException("未导入凭证", 40001)
 
         val vars = JSONObject()
@@ -418,6 +423,27 @@ class SignApi(private val store: TokenStore) {
             seatName = r.optString("seat_name"),
             expText = r.optString("exp_date_str"),
         )
+    }
+
+    /**
+     * 用指定凭证向服务器查用户名：真实姓名（user_student_name）优先，
+     * 其次微信昵称（user_nick），再其次学号。查不到或失败返回 null，
+     * 界面层会退回 JWT 猜名/手填。
+     */
+    suspend fun fetchUserLabel(token: String): String? {
+        return try {
+            val data = gql("userProfile", SignSpec.Q_USER_PROFILE, tokenOverride = token)
+            val cu = data.optJSONObject("userAuth")?.optJSONObject("currentUser")
+                ?: return null
+            val real = cu.optString("user_student_name").trim()
+            if (real.isNotEmpty()) return real
+            val nick = cu.optString("user_nick").trim()
+            if (nick.isNotEmpty()) return nick
+            val no = cu.optString("user_student_no").trim()
+            if (no.isNotEmpty()) "学号 $no" else null
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** 轮询二维码状态（换码/签到成功） */

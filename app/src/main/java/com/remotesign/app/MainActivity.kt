@@ -246,9 +246,17 @@ private fun LibrarySignApp() {
         }
     }
 
-    /** 拿到一份新凭证（粘贴/换码/扫码）→ 先命名再保存 */
+    /** 拿到一份新凭证（粘贴/换码/扫码）→ 先向服务器查用户名，再命名保存 */
     fun onObtained(session: Session, source: CredSource) {
-        state = UiState.Labeling(session, store.suggestedLabel(session.token), source)
+        state = UiState.Loading("正在向服务器确认用户名…")
+        scope.launch {
+            val fromServer = api.fetchUserLabel(session.token)
+            state = UiState.Labeling(
+                session,
+                fromServer ?: store.suggestedLabel(session.token),
+                source,
+            )
+        }
     }
 
     fun onLabelSaved(session: Session, source: CredSource, label: String) {
