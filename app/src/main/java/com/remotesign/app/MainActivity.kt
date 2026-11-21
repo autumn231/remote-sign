@@ -42,6 +42,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -418,6 +419,7 @@ private fun HomeScreen(
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(horizontal = 16.dp)
                 .aspectRatio(1.35f)
                 .clip(RoundedCornerShape(20.dp)),
         )
@@ -431,7 +433,7 @@ private fun HomeScreen(
                     fontSize = 15.sp,
                 )
             }
-            TextButton(onClick = onAbout) { Text("关于") }
+            OutlinedButton(onClick = onAbout) { Text("关于") }
         }
         Spacer(Modifier.height(24.dp))
 
