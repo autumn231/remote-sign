@@ -419,8 +419,7 @@ private fun HomeScreen(
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .aspectRatio(1.35f)
+                .aspectRatio(1.5f)
                 .clip(RoundedCornerShape(20.dp)),
         )
         Spacer(Modifier.height(20.dp))
